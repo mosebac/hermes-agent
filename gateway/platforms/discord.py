@@ -50,6 +50,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 import re
 
+from gateway.platforms.claude_code_bridge import ClaudeCodeThreadBridge
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
 from utils import atomic_json_write
 from gateway.platforms.base import (
@@ -593,6 +594,8 @@ class DiscordAdapter(BasePlatformAdapter):
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+        self._claude_code_bridge = ClaudeCodeThreadBridge()
+        self._claude_code_locks: Dict[str, asyncio.Lock] = {}
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -3047,6 +3050,25 @@ class DiscordAdapter(BasePlatformAdapter):
             # so a rejected invoker can receive an ephemeral rejection.
             await self._handle_thread_create_slash(interaction, name, message, auto_archive_duration)
 
+        @tree.command(name="cc-start", description="Attach Claude Code to this thread")
+        @discord.app_commands.describe(
+            workdir="Working directory Claude Code should use",
+            model="Model alias or full Claude model name (default: sonnet)",
+        )
+        async def slash_cc_start(interaction: discord.Interaction, workdir: str, model: str = "sonnet"):
+            await interaction.response.defer(ephemeral=True)
+            await self._handle_cc_start_slash(interaction, workdir, model)
+
+        @tree.command(name="cc-status", description="Show Claude Code status for this thread")
+        async def slash_cc_status(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            await self._handle_cc_status_slash(interaction)
+
+        @tree.command(name="cc-stop", description="Detach Claude Code from this thread")
+        async def slash_cc_stop(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+            await self._handle_cc_stop_slash(interaction)
+
         @tree.command(name="queue", description="Queue a prompt for the next turn (doesn't interrupt)")
         @discord.app_commands.describe(prompt="The prompt to queue")
         async def slash_queue(interaction: discord.Interaction, prompt: str):
@@ -3538,6 +3560,122 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
+    async def _handle_cc_start_slash(
+        self,
+        interaction: discord.Interaction,
+        workdir: str,
+        model: str = "sonnet",
+    ) -> None:
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.followup.send(
+                "Use `/cc-start` inside a Discord thread. 1 thread = 1 Claude Code session.",
+                ephemeral=True,
+            )
+            return
+        try:
+            session = self._claude_code_bridge.start_session(
+                thread_id=str(interaction.channel.id),
+                channel_id=str(interaction.channel.id),
+                user_id=str(interaction.user.id),
+                workdir=workdir,
+                model=model,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"Failed to attach Claude Code: {exc}", ephemeral=True)
+            return
+
+        self._threads.mark(str(interaction.channel.id))
+        await interaction.followup.send(
+            (
+                "Claude Code attached to this thread.\n"
+                f"workdir: `{session['workdir']}`\n"
+                f"model: `{session['model']}`\n"
+                "Send normal messages in this thread and they'll go to Claude Code.\n"
+                "Use `/cc-status` or `/cc-stop` when needed."
+            ),
+            ephemeral=True,
+        )
+
+    async def _handle_cc_status_slash(self, interaction: discord.Interaction) -> None:
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.followup.send(
+                "`/cc-status` only makes sense inside a thread.",
+                ephemeral=True,
+            )
+            return
+        thread_id = str(interaction.channel.id)
+        status = self._claude_code_bridge.format_status(thread_id)
+        lock = self._claude_code_locks.get(thread_id)
+        if lock and lock.locked():
+            status += "\nstatus: `busy`"
+        else:
+            status += "\nstatus: `idle`"
+        await interaction.followup.send(status, ephemeral=True)
+
+    async def _handle_cc_stop_slash(self, interaction: discord.Interaction) -> None:
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.followup.send(
+                "`/cc-stop` only makes sense inside a thread.",
+                ephemeral=True,
+            )
+            return
+        thread_id = str(interaction.channel.id)
+        removed = self._claude_code_bridge.stop_session(thread_id)
+        if removed:
+            await interaction.followup.send("Claude Code detached from this thread.", ephemeral=True)
+        else:
+            await interaction.followup.send("No Claude Code session was attached to this thread.", ephemeral=True)
+
+    async def _handle_claude_code_thread_message(
+        self,
+        *,
+        thread_id: str,
+        channel_id: str,
+        prompt: str,
+        reply_to: str | None = None,
+    ) -> None:
+        lock = self._claude_code_locks.setdefault(thread_id, asyncio.Lock())
+        if lock.locked():
+            await self.send(
+                channel_id,
+                "Claude Code is already working on the previous message in this thread.",
+                reply_to=reply_to,
+                metadata={"thread_id": thread_id},
+            )
+            return
+
+        async with lock:
+            await self.send(
+                channel_id,
+                "cc: processing…",
+                reply_to=reply_to,
+                metadata={"thread_id": thread_id},
+            )
+            try:
+                result = await self._claude_code_bridge.run_prompt(thread_id, prompt)
+            except Exception as exc:
+                await self.send(
+                    channel_id,
+                    f"Claude Code bridge error: {exc}",
+                    reply_to=reply_to,
+                    metadata={"thread_id": thread_id},
+                )
+                return
+
+            response = result.text
+            if result.permission_denials:
+                response = (
+                    f"{response}\n\n"
+                    f"permission_denials: `{len(result.permission_denials)}` "
+                    "(Claude Code asked for permissions outside `acceptEdits`)"
+                )
+            await self.send(
+                channel_id,
+                response,
+                reply_to=reply_to,
+                metadata={"thread_id": thread_id},
+            )
+
     def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
         """Look up auto-skill bindings for a Discord channel/forum thread.
 
@@ -3882,7 +4020,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content = re.sub(r"<@[!&]?\d+>", "", content)
         content = re.sub(r"<#\d+>", "", content)
         content = re.sub(r"\s+", " ", content).strip()
-        thread_name = content[:80] if content else "Hermes"
+        thread_name = content[:80] if content else "Kusanagi Motoclaw"
         if len(content) > 80:
             thread_name = thread_name[:77] + "..."
 
@@ -4755,6 +4893,15 @@ class DiscordAdapter(BasePlatformAdapter):
         # — the context IS the message, so skip the placeholder.
         if (not event_text or not event_text.strip()) and not _channel_context:
             event_text = "(The user sent a message with no text content)"
+
+        if thread_id and msg_type == MessageType.TEXT and self._claude_code_bridge.is_active(thread_id):
+            await self._handle_claude_code_thread_message(
+                thread_id=thread_id,
+                channel_id=str(effective_channel.id),
+                prompt=event_text,
+                reply_to=str(message.id),
+            )
+            return
 
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")

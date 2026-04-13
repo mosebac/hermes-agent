@@ -89,12 +89,6 @@ class FakeTree:
 
         return decorator
 
-    def add_command(self, cmd):
-        self.commands[cmd.name] = cmd
-
-    def get_commands(self):
-        return [SimpleNamespace(name=n) for n in self.commands]
-
 
 @pytest.fixture
 def adapter():
@@ -142,20 +136,20 @@ async def test_registers_native_thread_slash_command(adapter):
 
 
 @pytest.mark.asyncio
-async def test_registers_native_restart_slash_command(adapter):
-    adapter._run_simple_slash = AsyncMock()
+async def test_registers_native_claude_code_slash_commands(adapter):
+    adapter._handle_cc_start_slash = AsyncMock()
+    adapter._handle_cc_status_slash = AsyncMock()
+    adapter._handle_cc_stop_slash = AsyncMock()
     adapter._register_slash_commands()
 
-    assert "restart" in adapter._client.tree.commands
+    assert "cc-start" in adapter._client.tree.commands
+    assert "cc-status" in adapter._client.tree.commands
+    assert "cc-stop" in adapter._client.tree.commands
 
-    interaction = SimpleNamespace()
-    await adapter._client.tree.commands["restart"](interaction)
-
-    adapter._run_simple_slash.assert_awaited_once_with(
-        interaction,
-        "/restart",
-        "Restart requested~",
-    )
+    interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()))
+    await adapter._client.tree.commands["cc-start"](interaction, workdir="~/dev/demo", model="sonnet")
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    adapter._handle_cc_start_slash.assert_awaited_once_with(interaction, "~/dev/demo", "sonnet")
 
 
 # ------------------------------------------------------------------
@@ -450,6 +444,48 @@ async def test_dispatch_thread_session_builds_thread_event(adapter):
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
     assert "TestGuild" in event.source.chat_name
+
+
+@pytest.mark.asyncio
+async def test_cc_start_slash_attaches_thread(adapter):
+    adapter._claude_code_bridge.start_session = MagicMock(return_value={
+        "workdir": "/tmp/demo",
+        "model": "sonnet",
+    })
+    interaction = SimpleNamespace(
+        channel=_FakeThreadChannel(channel_id=555, name="Planning"),
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    await adapter._handle_cc_start_slash(interaction, "~/dev/demo", "sonnet")
+
+    adapter._claude_code_bridge.start_session.assert_called_once()
+    interaction.followup.send.assert_awaited_once()
+    sent_text = interaction.followup.send.await_args.args[0]
+    assert "Claude Code attached" in sent_text
+    assert "/tmp/demo" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_handle_message_routes_active_thread_to_claude_code(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    adapter._claude_code_bridge.is_active = MagicMock(return_value=True)
+    adapter._handle_claude_code_thread_message = AsyncMock()
+    adapter.handle_message = AsyncMock()
+
+    msg = _fake_message(_FakeThreadChannel(channel_id=999, name="cc-thread"), content="Do the thing")
+
+    await adapter._handle_message(msg)
+
+    adapter._handle_claude_code_thread_message.assert_awaited_once()
+    kwargs = adapter._handle_claude_code_thread_message.await_args.kwargs
+    assert kwargs["thread_id"] == "999"
+    assert kwargs["channel_id"] == "999"
+    assert kwargs["prompt"] == "Do the thing"
+    adapter.handle_message.assert_not_awaited()
 
 
 # ------------------------------------------------------------------
@@ -980,4 +1016,3 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
     # (covered in other tests). The autocomplete filter itself is exercised
     # via direct function call in the real-discord integration path.
     assert skill_cmd.callback is not None
-
