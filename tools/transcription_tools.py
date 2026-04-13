@@ -409,7 +409,15 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
         # Lazy-load the model (downloads on first use, ~150 MB for 'base')
         if _local_model is None or _local_model_name != model_name:
             logger.info("Loading faster-whisper model '%s' (first load downloads the model)...", model_name)
-            _local_model = _load_local_whisper_model(model_name)
+            # Resolve local cache path to avoid HuggingFace Hub network calls hanging on WSL2.
+            # On this host we want CPU/int8 even when CUDA libs are partially detectable.
+            import os as _os, glob as _glob
+            _hf_cache = _os.path.expanduser("~/.cache/huggingface/hub")
+            _pattern = f"{_hf_cache}/models--Systran--faster-whisper-{model_name}/snapshots/*/model.bin"
+            _matches = _glob.glob(_pattern)
+            _model_arg = _os.path.dirname(_matches[0]) if _matches else model_name
+            logger.info("Using model path: %s", _model_arg)
+            _local_model = WhisperModel(_model_arg, device="cpu", compute_type="int8")
             _local_model_name = model_name
 
         # Language: config.yaml (stt.local.language) > env var > auto-detect.
