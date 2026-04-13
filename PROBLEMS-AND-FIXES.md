@@ -27,3 +27,17 @@ Added a persistent `ClaudeCodeThreadBridge` in `gateway/platforms/claude_code_br
 
 ### Prevention
 Keep thread-scoped external-agent bridges outside the main Hermes conversation loop, persist their state under `~/.hermes/custom/`, and add adapter tests for slash registration plus active-thread routing before restarting the gateway. Also document every local source patch in `~/.hermes/PATCHES.md` so `hermes update` does not wipe the custom behavior.
+
+## 2026-04-13 — Claude Code bridge dropped Discord photos/audio and leaked media cache leftovers
+
+### Symptom
+A `/cc-start` thread only forwarded plain text to Claude Code. Photo and audio attachments did not reach Claude Code at all. On top of that, cached audio files had no scheduled TTL cleanup, and image files would have accumulated if media support had been added without explicit deletion.
+
+### Root Cause
+The Discord adapter only routed active Claude Code threads when `msg_type == MessageType.TEXT`. Media caching happened in the normal Hermes pipeline, not in a Claude-Code-specific prompt builder, so there was no bridge path for image/audio attachments and no per-turn cleanup hook. Separately, `gateway/run.py` wired hourly cleanup for image/document caches but not audio.
+
+### Fix
+Added Claude-Code-specific media handling in `gateway/platforms/discord.py`: active Claude Code threads now accept text, image, and audio messages; images are cached and passed to Claude Code as temporary local file paths, then deleted immediately after the turn; audio is cached only long enough to run STT, then deleted immediately, and Claude Code receives only the transcript text. Also added `cleanup_audio_cache()` in `gateway/platforms/base.py` and wired it into the hourly gateway cron cleanup in `gateway/run.py`. Added regression tests for photo routing, audio transcription prompt building, per-turn temp-file deletion, and audio-cache TTL cleanup.
+
+### Prevention
+When extending an external-agent bridge beyond plain text, do not reuse the generic media pipeline blindly. Build an explicit bridge prompt path for each media type, define file lifecycle up front, and enforce double protection: immediate per-file deletion after use plus hourly TTL cleanup for crash leftovers.

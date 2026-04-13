@@ -488,6 +488,90 @@ async def test_handle_message_routes_active_thread_to_claude_code(adapter, monke
     adapter.handle_message.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_handle_message_routes_active_thread_photo_to_claude_code(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    adapter._claude_code_bridge.is_active = MagicMock(return_value=True)
+    adapter._build_claude_code_thread_prompt = AsyncMock(return_value=("inspect /tmp/cat.png", ["/tmp/cat.png"]))
+    adapter._handle_claude_code_thread_message = AsyncMock()
+    adapter.handle_message = AsyncMock()
+
+    msg = _fake_message(_FakeThreadChannel(channel_id=999, name="cc-thread"), content="")
+    msg.attachments = [
+        SimpleNamespace(
+            content_type="image/png",
+            filename="cat.png",
+            url="https://example.com/cat.png",
+            size=123,
+        )
+    ]
+
+    await adapter._handle_message(msg)
+
+    adapter._build_claude_code_thread_prompt.assert_awaited_once_with(msg, "")
+    adapter._handle_claude_code_thread_message.assert_awaited_once()
+    kwargs = adapter._handle_claude_code_thread_message.await_args.kwargs
+    assert kwargs["thread_id"] == "999"
+    assert kwargs["channel_id"] == "999"
+    assert kwargs["prompt"] == "inspect /tmp/cat.png"
+    assert kwargs["cleanup_paths"] == ["/tmp/cat.png"]
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_build_claude_code_thread_prompt_transcribes_audio_and_deletes_temp_file(adapter, monkeypatch, tmp_path):
+    cached_audio = tmp_path / "voice.ogg"
+    cached_audio.write_bytes(b"audio")
+
+    async def _fake_cache_audio(url, ext=".ogg", retries=2):
+        return str(cached_audio)
+
+    monkeypatch.setattr("gateway.platforms.discord.cache_audio_from_url", _fake_cache_audio)
+    monkeypatch.setattr(
+        "tools.transcription_tools.transcribe_audio",
+        lambda path: {"success": True, "transcript": "bonjour le monde", "provider": "local"},
+    )
+
+    msg = _fake_message(_FakeThreadChannel(channel_id=999, name="cc-thread"), content="")
+    msg.attachments = [
+        SimpleNamespace(
+            content_type="audio/ogg",
+            filename="voice.ogg",
+            url="https://example.com/voice.ogg",
+            size=123,
+        )
+    ]
+
+    prompt, cleanup_paths = await adapter._build_claude_code_thread_prompt(msg, "")
+
+    assert "bonjour le monde" in prompt
+    assert "voice.ogg" in prompt
+    assert cleanup_paths == []
+    assert not cached_audio.exists()
+
+
+@pytest.mark.asyncio
+async def test_handle_claude_code_thread_message_deletes_cleanup_paths(adapter, tmp_path):
+    image_path = tmp_path / "cat.png"
+    image_path.write_bytes(b"png")
+    adapter._claude_code_bridge.run_prompt = AsyncMock(
+        return_value=SimpleNamespace(text="done", permission_denials=[])
+    )
+    adapter.send = AsyncMock()
+
+    await adapter._handle_claude_code_thread_message(
+        thread_id="999",
+        channel_id="999",
+        prompt="inspect image",
+        cleanup_paths=[str(image_path)],
+    )
+
+    assert not image_path.exists()
+    assert adapter.send.await_count == 2
+
+
 # ------------------------------------------------------------------
 # _build_slash_event — preserve thread context for native slash commands
 # ------------------------------------------------------------------

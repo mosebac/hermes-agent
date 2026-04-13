@@ -3633,6 +3633,7 @@ class DiscordAdapter(BasePlatformAdapter):
         channel_id: str,
         prompt: str,
         reply_to: str | None = None,
+        cleanup_paths: list[str] | None = None,
     ) -> None:
         lock = self._claude_code_locks.setdefault(thread_id, asyncio.Lock())
         if lock.locked():
@@ -3644,6 +3645,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return
 
+        cleanup_paths = [path for path in (cleanup_paths or []) if path]
         async with lock:
             await self.send(
                 channel_id,
@@ -3661,6 +3663,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     metadata={"thread_id": thread_id},
                 )
                 return
+            finally:
+                self._cleanup_local_paths(cleanup_paths)
 
             response = result.text
             if result.permission_denials:
@@ -3675,6 +3679,77 @@ class DiscordAdapter(BasePlatformAdapter):
                 reply_to=reply_to,
                 metadata={"thread_id": thread_id},
             )
+
+    def _cleanup_local_paths(self, paths: list[str]) -> None:
+        for path in paths:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.debug("[%s] Failed to delete temp file %s: %s", self.name, path, exc)
+
+    async def _build_claude_code_thread_prompt(
+        self,
+        message: Any,
+        base_text: str,
+    ) -> tuple[str, list[str]]:
+        prompt_parts: list[str] = []
+        cleanup_paths: list[str] = []
+        user_text = (base_text or "").strip()
+        if user_text:
+            prompt_parts.append(user_text)
+
+        image_lines: list[str] = []
+        audio_lines: list[str] = []
+        for att in getattr(message, "attachments", []) or []:
+            content_type = (getattr(att, "content_type", None) or "").lower()
+            filename = getattr(att, "filename", None) or "attachment"
+            if content_type.startswith("image/"):
+                ext = "." + content_type.split("/")[-1].split(";")[0]
+                if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                    ext = ".jpg"
+                try:
+                    cached_path = await cache_image_from_url(att.url, ext=ext)
+                    cleanup_paths.append(cached_path)
+                    image_lines.append(f"- {filename}: `{cached_path}`")
+                except Exception as exc:
+                    image_lines.append(f"- {filename}: [image download failed: {exc}]")
+            elif content_type.startswith("audio/"):
+                ext = "." + content_type.split("/")[-1].split(";")[0]
+                if ext not in (".ogg", ".mp3", ".wav", ".webm", ".m4a"):
+                    ext = ".ogg"
+                cached_path = None
+                try:
+                    cached_path = await cache_audio_from_url(att.url, ext=ext)
+                    from tools.transcription_tools import transcribe_audio
+
+                    result = await asyncio.to_thread(transcribe_audio, cached_path)
+                    transcript = (result.get("transcript") or "").strip()
+                    if result.get("success") and transcript:
+                        audio_lines.append(f"- {filename}: {transcript}")
+                    else:
+                        error = result.get("error") or "transcription failed"
+                        audio_lines.append(f"- {filename}: [transcription unavailable: {error}]")
+                except Exception as exc:
+                    audio_lines.append(f"- {filename}: [transcription unavailable: {exc}]")
+                finally:
+                    if cached_path:
+                        self._cleanup_local_paths([cached_path])
+
+        if image_lines:
+            prompt_parts.append(
+                "The user attached image file(s). These temporary local paths are available for this turn only:\n"
+                + "\n".join(image_lines)
+            )
+        if audio_lines:
+            prompt_parts.append(
+                "Hermes transcribed the attached audio file(s). Use only these transcripts; the raw audio is not provided:\n"
+                + "\n".join(audio_lines)
+            )
+        if not prompt_parts:
+            prompt_parts.append("(The user sent a message with no text content)")
+        return "\n\n".join(prompt_parts), cleanup_paths
 
     def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
         """Look up auto-skill bindings for a Discord channel/forum thread.
@@ -4732,6 +4807,18 @@ class DiscordAdapter(BasePlatformAdapter):
             message_id=str(message.id),
         )
 
+        active_cc_thread = bool(thread_id and self._claude_code_bridge.is_active(thread_id))
+        if active_cc_thread and msg_type in (MessageType.TEXT, MessageType.PHOTO, MessageType.AUDIO):
+            prompt, cleanup_paths = await self._build_claude_code_thread_prompt(message, message.content)
+            await self._handle_claude_code_thread_message(
+                thread_id=thread_id,
+                channel_id=str(effective_channel.id),
+                prompt=prompt,
+                reply_to=str(message.id),
+                cleanup_paths=cleanup_paths,
+            )
+            return
+
         # Build media URLs -- download image attachments to local cache so the
         # vision tool can access them reliably (Discord CDN URLs can expire).
         media_urls = []
@@ -4893,15 +4980,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # — the context IS the message, so skip the placeholder.
         if (not event_text or not event_text.strip()) and not _channel_context:
             event_text = "(The user sent a message with no text content)"
-
-        if thread_id and msg_type == MessageType.TEXT and self._claude_code_bridge.is_active(thread_id):
-            await self._handle_claude_code_thread_message(
-                thread_id=thread_id,
-                channel_id=str(effective_channel.id),
-                prompt=event_text,
-                reply_to=str(message.id),
-            )
-            return
 
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
