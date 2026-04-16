@@ -22,8 +22,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "sonnet"
 _DEFAULT_PERMISSION_MODE = "bypassPermissions"
-_DEFAULT_MAX_TURNS = 10
+_DEFAULT_MAX_TURNS = 100
 _DEFAULT_TIMEOUT_SECONDS = 900
+_DEFAULT_EFFORT = ""  # empty = let Claude Code use its own default (medium)
+_VALID_EFFORT_LEVELS = ("low", "medium", "high", "max")
 
 
 @dataclass
@@ -46,6 +48,7 @@ class ClaudeCodeThreadBridge:
         default_permission_mode: str = _DEFAULT_PERMISSION_MODE,
         default_max_turns: int = _DEFAULT_MAX_TURNS,
         default_timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
+        default_effort: str = _DEFAULT_EFFORT,
     ) -> None:
         self.state_path = state_path or (
             get_hermes_home() / "custom" / "claude-code" / "discord-thread-sessions.json"
@@ -55,6 +58,7 @@ class ClaudeCodeThreadBridge:
         self.default_permission_mode = default_permission_mode
         self.default_max_turns = default_max_turns
         self.default_timeout_seconds = default_timeout_seconds
+        self.default_effort = default_effort
 
     def start_session(
         self,
@@ -67,12 +71,17 @@ class ClaudeCodeThreadBridge:
         permission_mode: str | None = None,
         max_turns: int | None = None,
         timeout_seconds: int | None = None,
+        effort: str | None = None,
     ) -> dict[str, Any]:
         resolved = self._resolve_workdir(workdir)
         if not resolved.exists():
             raise FileNotFoundError(f"workdir not found: {resolved}")
         if not resolved.is_dir():
             raise NotADirectoryError(f"workdir is not a directory: {resolved}")
+
+        effort_val = (effort or self.default_effort).strip().lower()
+        if effort_val and effort_val not in _VALID_EFFORT_LEVELS:
+            raise ValueError(f"invalid effort level '{effort_val}': choose from {_VALID_EFFORT_LEVELS}")
 
         state = self._load_state()
         thread_state = {
@@ -84,6 +93,7 @@ class ClaudeCodeThreadBridge:
             "permission_mode": (permission_mode or self.default_permission_mode).strip() or self.default_permission_mode,
             "max_turns": int(max_turns or self.default_max_turns),
             "timeout_seconds": int(timeout_seconds or self.default_timeout_seconds),
+            "effort": effort_val,
             "session_id": None,
             "started_at": self._now_iso(),
             "updated_at": self._now_iso(),
@@ -110,11 +120,14 @@ class ClaudeCodeThreadBridge:
         if not session:
             return "Claude Code n'est pas attaché à ce thread."
         session_id = session.get("session_id") or "—"
+        effort = session.get("effort") or "default (medium)"
         return (
             "Claude Code actif\n"
             f"workdir: `{session['workdir']}`\n"
             f"model: `{session['model']}`\n"
             f"permission_mode: `{session['permission_mode']}`\n"
+            f"max_turns: `{session.get('max_turns', '—')}`\n"
+            f"effort: `{effort}`\n"
             f"session_id: `{session_id}`\n"
             f"updated: `{session.get('updated_at', '—')}`"
         )
@@ -145,6 +158,9 @@ class ClaudeCodeThreadBridge:
         model = (session.get("model") or self.default_model).strip()
         if model:
             cmd.extend(["--model", model])
+        effort = (session.get("effort") or self.default_effort).strip().lower()
+        if effort and effort in _VALID_EFFORT_LEVELS:
+            cmd.extend(["--effort", effort])
         prior_session_id = (session.get("session_id") or "").strip()
         if prior_session_id:
             cmd.extend(["--resume", prior_session_id])

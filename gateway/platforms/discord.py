@@ -3054,10 +3054,18 @@ class DiscordAdapter(BasePlatformAdapter):
         @discord.app_commands.describe(
             workdir="Working directory Claude Code should use",
             model="Model alias or full Claude model name (default: sonnet)",
+            max_turns="Max tool-use turns per prompt (default: 100)",
+            effort="Reasoning effort level: low, medium, high, max (default: medium)",
         )
-        async def slash_cc_start(interaction: discord.Interaction, workdir: str, model: str = "sonnet"):
+        async def slash_cc_start(
+            interaction: discord.Interaction,
+            workdir: str,
+            model: str = "sonnet",
+            max_turns: int = 100,
+            effort: str = "",
+        ):
             await interaction.response.defer(ephemeral=True)
-            await self._handle_cc_start_slash(interaction, workdir, model)
+            await self._handle_cc_start_slash(interaction, workdir, model, max_turns, effort)
 
         @tree.command(name="cc-status", description="Show Claude Code status for this thread")
         async def slash_cc_status(interaction: discord.Interaction):
@@ -3565,6 +3573,8 @@ class DiscordAdapter(BasePlatformAdapter):
         interaction: discord.Interaction,
         workdir: str,
         model: str = "sonnet",
+        max_turns: int = 100,
+        effort: str = "",
     ) -> None:
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.followup.send(
@@ -3579,17 +3589,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 user_id=str(interaction.user.id),
                 workdir=workdir,
                 model=model,
+                max_turns=max_turns,
+                effort=effort or None,
             )
         except Exception as exc:
             await interaction.followup.send(f"Failed to attach Claude Code: {exc}", ephemeral=True)
             return
 
         self._threads.mark(str(interaction.channel.id))
+        effort_display = session.get("effort") or "default (medium)"
         await interaction.followup.send(
             (
                 "Claude Code attached to this thread.\n"
                 f"workdir: `{session['workdir']}`\n"
                 f"model: `{session['model']}`\n"
+                f"max_turns: `{session['max_turns']}`\n"
+                f"effort: `{effort_display}`\n"
                 "Send normal messages in this thread and they'll go to Claude Code.\n"
                 "Use `/cc-status` or `/cc-stop` when needed."
             ),
