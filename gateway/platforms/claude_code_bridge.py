@@ -165,13 +165,21 @@ class ClaudeCodeThreadBridge:
         raw_output = (proc.stdout or "").strip()
         raw_error = (proc.stderr or "").strip()
         payload = self._parse_payload(raw_output or raw_error)
-        result_text = (
-            payload.get("result")
-            or payload.get("error")
-            or raw_output
-            or raw_error
-            or f"Claude Code exited with status {proc.returncode}."
-        ).strip()
+
+        if payload.get("result"):
+            result_text = payload["result"]
+        elif payload.get("is_error") or (payload.get("subtype") or "").startswith("error"):
+            subtype = payload.get("subtype") or "error"
+            errors = payload.get("errors") or []
+            if errors:
+                result_text = f"Claude Code error ({subtype}): {'; '.join(str(e) for e in errors)}"
+            else:
+                result_text = f"Claude Code error ({subtype})"
+        elif payload.get("error"):
+            result_text = payload["error"]
+        else:
+            result_text = raw_output or raw_error or f"Claude Code exited with status {proc.returncode}."
+        result_text = result_text.strip()
         session["session_id"] = payload.get("session_id") or session.get("session_id")
         session["updated_at"] = self._now_iso()
         session["last_error"] = None if proc.returncode == 0 else (raw_error or result_text)
