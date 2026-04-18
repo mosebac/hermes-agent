@@ -819,6 +819,8 @@ class ProcessRegistry:
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "output": output_tail,
+                "started_at": session.started_at,
+                "finished_at": time.time(),
             })
 
     # ----- Query Methods -----
@@ -846,6 +848,15 @@ class ProcessRegistry:
             if text:
                 results.append((evt, text))
         return results
+
+    def mark_completion_delivered(self, session_id: str) -> None:
+        """Mark a completion as already delivered to the agent.
+
+        Used to coordinate between the per-process watcher task and the
+        per-turn completion-queue drain so the same event is not injected
+        twice when both paths race.
+        """
+        self._completion_consumed.add(session_id)
 
     def get(self, session_id: str) -> Optional[ProcessSession]:
         """Get a session by ID (running or finished)."""

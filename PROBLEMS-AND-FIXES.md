@@ -41,3 +41,31 @@ Added Claude-Code-specific media handling in `gateway/platforms/discord.py`: act
 
 ### Prevention
 When extending an external-agent bridge beyond plain text, do not reuse the generic media pipeline blindly. Build an explicit bridge prompt path for each media type, define file lifecycle up front, and enforce double protection: immediate per-file deletion after use plus hourly TTL cleanup for crash leftovers.
+
+## 2026-04-17 — `/cc-start` slash handler drifted from bridge state and tests
+
+### Symptom
+The Discord Claude Code bridge looked implemented, but the targeted gateway tests failed: one slash-command registration test expected the old `_handle_cc_start_slash(...)` signature, and one attach-flow test crashed with `KeyError: 'max_turns'` when the mocked bridge session omitted that field.
+
+### Root Cause
+The slash command gained `max_turns` and `effort` parameters, but one regression test still asserted the legacy 3-argument call. Separately, the success message in `gateway/platforms/discord.py` assumed `start_session()` always returned `max_turns`, which is true in production bridge state but not guaranteed in lighter mocks or future partial session payloads.
+
+### Fix
+Updated the Discord adapter to display `session.get("max_turns", max_turns)` and updated the slash-command regression test to assert the full current `_handle_cc_start_slash(interaction, workdir, model, 100, "")` call. Re-ran the bridge test slice: `26 passed`.
+
+### Prevention
+When a slash command grows new parameters, update both the adapter tests and any human-facing status formatting in the same change. For bridge/session payloads, prefer `.get(..., fallback)` over hard indexing in UI strings so tests and partial mocks don't mask a working runtime path.
+
+## 2026-04-18 — Hermes orchestration could miss Claude Code completion notifications
+
+### Symptom
+In Hermes-orchestrated development mode, Claude Code lots could finish successfully without notifying the user. The system could also blur the real Claude development lot with short-lived support process noise, making the reporting feel broken.
+
+### Root Cause
+Gateway-side completion handling relied too heavily on the per-process watcher path and the injected event stream. If that watcher was delayed, lost, or raced with recovery, `completion` events sitting in `completion_queue` were not injected as user-visible notifications. At the same time, there was no coordinated de-duplication between watcher delivery and per-turn drain delivery, and no way to suppress tiny successful non-Claude support processes while always preserving real Claude Code completions.
+
+### Fix
+Patched `gateway/run.py` and `tools/process_registry.py` so the gateway now drains real `completion` events as a fallback delivery path, records completion delivery/consumption to avoid duplicate injections, pins watcher tasks in `self._background_tasks`, and suppresses only short successful non-Claude noise via `background_process_notification_min_seconds`. Added regression coverage in `tests/gateway/test_completion_fallback_drain.py` and validated the full slice with targeted pytest plus a real tiny background Claude Code run whose completion notification was actually delivered in-channel.
+
+### Prevention
+For Hermes → Claude Code orchestration, never trust one notification path. Keep watcher delivery and queue-drain fallback in parity, mark completions as delivered/consumed explicitly, and require a live end-to-end proof (real Claude background proc + actual in-channel completion message) after any reporting patch.

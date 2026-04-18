@@ -1041,7 +1041,12 @@ def _parse_session_key(session_key: str) -> "dict | None":
 
 
 def _format_gateway_process_notification(evt: dict) -> "str | None":
-    """Format a watch pattern event from completion_queue into a [IMPORTANT:] message."""
+    """Format a completion_queue event into a [SYSTEM:] message.
+
+    Handles completion events (notify_on_complete), watch pattern matches,
+    and watch-disabled events. Mirrors cli._format_process_notification so
+    the Discord/Telegram path is at parity with the CLI path.
+    """
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
     _cmd = evt.get("command", "unknown")
@@ -1064,7 +1069,15 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
-    return None
+    # Completion event (notify_on_complete)
+    _exit = evt.get("exit_code", "?")
+    _out = evt.get("output", "")
+    return (
+        f"[SYSTEM: Background process {_sid} completed "
+        f"(exit code {_exit}).\n"
+        f"Command: {_cmd}\n"
+        f"Output:\n{_out}]"
+    )
 
 
 # Module-level weak reference to the active GatewayRunner instance.
@@ -2516,6 +2529,83 @@ class GatewayRunner:
         return mode
 
     @staticmethod
+    def _load_background_notifications_min_seconds() -> float:
+        """Minimum runtime below which a *successful, non-Claude-Code* completion
+        notification is suppressed as noise.
+
+        Failures, Claude Code runs, and long-running processes are always
+        delivered. Default 0 = disabled (every completion is reported).
+        """
+        raw = os.getenv("HERMES_BACKGROUND_NOTIFICATION_MIN_SECONDS", "")
+        if not raw:
+            try:
+                import yaml as _y
+                cfg_path = _hermes_home / "config.yaml"
+                if cfg_path.exists():
+                    with open(cfg_path, encoding="utf-8") as _f:
+                        cfg = _y.safe_load(_f) or {}
+                    val = cfg.get("display", {}).get(
+                        "background_process_notification_min_seconds"
+                    )
+                    if val is not None:
+                        raw = str(val)
+            except Exception:
+                pass
+        try:
+            return max(0.0, float(raw or "0"))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _is_claude_code_command(command: str) -> bool:
+        """Heuristic: does this command look like a Claude Code invocation?
+
+        Claude Code runs must ALWAYS be reported, regardless of duration or
+        exit code, because they are the whole point of the bridge.
+        """
+        if not command:
+            return False
+        c = command.lower().strip()
+        if "claude-code" in c:
+            return True
+        # Match the `claude` binary at the start of a command segment so a
+        # path like `unclaude` does not match, but `/usr/local/bin/claude`
+        # and `claude ...` both do.
+        import re as _re
+        return bool(_re.search(r"(^|[\s/'\"])claude(\s|$)", c))
+
+    @classmethod
+    def _is_noise_completion(cls, evt: dict, min_seconds: float) -> bool:
+        """Should a completion event be suppressed as support-process noise?
+
+        Returns True only when ALL of these hold:
+          - exit_code == 0 (success)
+          - duration < min_seconds (short-lived)
+          - command is not a Claude Code invocation
+          - min_seconds is configured (> 0)
+
+        Failures, long runs, and Claude Code runs are never suppressed.
+        """
+        if min_seconds <= 0:
+            return False
+        if evt.get("exit_code") not in (0, None):
+            if evt.get("exit_code") != 0:
+                return False
+        try:
+            started = float(evt.get("started_at") or 0)
+            finished = float(evt.get("finished_at") or time.time())
+        except (TypeError, ValueError):
+            return False
+        if started <= 0:
+            return False
+        duration = max(0.0, finished - started)
+        if duration >= min_seconds:
+            return False
+        if cls._is_claude_code_command(evt.get("command", "")):
+            return False
+        return True
+
+    @staticmethod
     def _load_provider_routing() -> dict:
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
@@ -3793,7 +3883,9 @@ class GatewayRunner:
             from tools.process_registry import process_registry
             while process_registry.pending_watchers:
                 watcher = process_registry.pending_watchers.pop(0)
-                asyncio.create_task(self._run_process_watcher(watcher))
+                _wtask = asyncio.create_task(self._run_process_watcher(watcher))
+                self._background_tasks.add(_wtask)
+                _wtask.add_done_callback(self._background_tasks.discard)
                 logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
         except Exception as e:
             logger.error("Recovered watcher setup error: %s", e)
@@ -7846,28 +7938,43 @@ class GatewayRunner:
                 from tools.process_registry import process_registry
                 while process_registry.pending_watchers:
                     watcher = process_registry.pending_watchers.pop(0)
-                    asyncio.create_task(self._run_process_watcher(watcher))
+                    _wtask = asyncio.create_task(self._run_process_watcher(watcher))
+                    self._background_tasks.add(_wtask)
+                    _wtask.add_done_callback(self._background_tasks.discard)
             except Exception as e:
                 logger.error("Process watcher setup error: %s", e)
 
-            # Drain watch pattern notifications that arrived during the agent run.
-            # Watch events and completions share the same queue; completions are
-            # already handled by the per-process watcher task above, so we only
-            # inject watch-type events here.
+            # Drain the completion_queue (watch matches AND completion events).
+            # The per-process watcher task is the primary delivery path for
+            # completions, but it can be delayed (5s poll), lost (task GC), or
+            # never started (recovery race). This drain is the fallback: if a
+            # completion is in the queue and has NOT already been consumed
+            # (via wait/poll/log or by the watcher itself), inject it here.
             try:
                 from tools.process_registry import process_registry as _pr
-                _watch_events = []
+                _drained_events = []
                 while not _pr.completion_queue.empty():
                     evt = _pr.completion_queue.get_nowait()
+                    _drained_events.append(evt)
+                _min_seconds = self._load_background_notifications_min_seconds()
+                for evt in _drained_events:
                     evt_type = evt.get("type", "completion")
-                    if evt_type in {"watch_match", "watch_disabled"}:
-                        _watch_events.append(evt)
-                    # else: completion events are handled by the watcher task
-                for evt in _watch_events:
+                    if evt_type == "completion":
+                        _sid = evt.get("session_id", "")
+                        if _sid and _pr.is_completion_consumed(_sid):
+                            continue
+                        if self._is_noise_completion(evt, _min_seconds):
+                            if _sid:
+                                _pr.mark_completion_delivered(_sid)
+                            continue
                     synth_text = _format_gateway_process_notification(evt)
                     if synth_text:
                         try:
                             await self._inject_watch_notification(synth_text, evt)
+                            if evt_type == "completion":
+                                _sid = evt.get("session_id", "")
+                                if _sid:
+                                    _pr.mark_completion_delivered(_sid)
                         except Exception as e2:
                             logger.error("Watch notification injection error: %s", e2)
             except Exception as e:
@@ -13680,6 +13787,20 @@ class GatewayRunner:
                 # Skip if the agent already consumed the result via wait/poll/log
                 from tools.process_registry import process_registry as _pr_check
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                    _min_seconds = self._load_background_notifications_min_seconds()
+                    _noise_evt = {
+                        "exit_code": session.exit_code,
+                        "command": getattr(session, "command", ""),
+                        "started_at": getattr(session, "started_at", 0),
+                        "finished_at": time.time(),
+                    }
+                    if self._is_noise_completion(_noise_evt, _min_seconds):
+                        _pr_check.mark_completion_delivered(session_id)
+                        logger.debug(
+                            "Suppressing noise completion notification for %s (cmd=%r)",
+                            session_id, session.command,
+                        )
+                        break
                     from tools.ansi_strip import strip_ansi
                     _out = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
                     synth_text = (
@@ -13725,6 +13846,7 @@ class GatewayRunner:
                                 source.thread_id,
                             )
                             await adapter.handle_message(synth_event)
+                            _pr_check.mark_completion_delivered(session_id)
                         except Exception as e:
                             logger.error("Agent notify injection error: %s", e)
                     break
