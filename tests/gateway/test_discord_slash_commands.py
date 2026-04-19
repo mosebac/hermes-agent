@@ -140,16 +140,25 @@ async def test_registers_native_claude_code_slash_commands(adapter):
     adapter._handle_cc_start_slash = AsyncMock()
     adapter._handle_cc_status_slash = AsyncMock()
     adapter._handle_cc_stop_slash = AsyncMock()
+    adapter._handle_cc_set_slash = AsyncMock()
     adapter._register_slash_commands()
 
     assert "cc-start" in adapter._client.tree.commands
     assert "cc-status" in adapter._client.tree.commands
     assert "cc-stop" in adapter._client.tree.commands
+    assert "cc-set" in adapter._client.tree.commands
 
     interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()))
     await adapter._client.tree.commands["cc-start"](interaction, workdir="~/dev/demo", model="sonnet")
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-    adapter._handle_cc_start_slash.assert_awaited_once_with(interaction, "~/dev/demo", "sonnet")
+    adapter._handle_cc_start_slash.assert_awaited_once_with(
+        interaction, "~/dev/demo", "sonnet", 250, "", ""
+    )
+
+    interaction2 = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()))
+    await adapter._client.tree.commands["cc-set"](interaction2, max_turns=500)
+    interaction2.response.defer.assert_awaited_once_with(ephemeral=True)
+    adapter._handle_cc_set_slash.assert_awaited_once_with(interaction2, 500, "", "")
 
 
 # ------------------------------------------------------------------
@@ -465,6 +474,66 @@ async def test_cc_start_slash_attaches_thread(adapter):
     sent_text = interaction.followup.send.await_args.args[0]
     assert "Claude Code attached" in sent_text
     assert "/tmp/demo" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_cc_set_slash_updates_session(adapter):
+    adapter._claude_code_bridge.is_active = MagicMock(return_value=True)
+    adapter._claude_code_bridge.update_session = MagicMock(return_value={
+        "max_turns": 500,
+        "effort": "high",
+        "permission_mode": "bypassPermissions",
+    })
+    interaction = SimpleNamespace(
+        channel=_FakeThreadChannel(channel_id=999, name="cc-thread"),
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    await adapter._handle_cc_set_slash(interaction, max_turns=500)
+
+    adapter._claude_code_bridge.update_session.assert_called_once_with(
+        "999", max_turns=500, effort=None, permission_mode=None,
+    )
+    interaction.followup.send.assert_awaited_once()
+    sent_text = interaction.followup.send.await_args.args[0]
+    assert "max_turns: `500`" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_cc_set_slash_requires_at_least_one_field(adapter):
+    adapter._claude_code_bridge.is_active = MagicMock(return_value=True)
+    adapter._claude_code_bridge.update_session = MagicMock()
+    interaction = SimpleNamespace(
+        channel=_FakeThreadChannel(channel_id=999, name="cc-thread"),
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    await adapter._handle_cc_set_slash(interaction)
+
+    adapter._claude_code_bridge.update_session.assert_not_called()
+    interaction.followup.send.assert_awaited_once()
+    sent_text = interaction.followup.send.await_args.args[0]
+    assert "at least one of" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_cc_set_slash_rejects_when_no_session(adapter):
+    adapter._claude_code_bridge.is_active = MagicMock(return_value=False)
+    adapter._claude_code_bridge.update_session = MagicMock()
+    interaction = SimpleNamespace(
+        channel=_FakeThreadChannel(channel_id=999, name="cc-thread"),
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    await adapter._handle_cc_set_slash(interaction, max_turns=500)
+
+    adapter._claude_code_bridge.update_session.assert_not_called()
+    interaction.followup.send.assert_awaited_once()
+    sent_text = interaction.followup.send.await_args.args[0]
+    assert "/cc-start" in sent_text
 
 
 @pytest.mark.asyncio

@@ -3054,18 +3054,22 @@ class DiscordAdapter(BasePlatformAdapter):
         @discord.app_commands.describe(
             workdir="Working directory Claude Code should use",
             model="Model alias or full Claude model name (default: sonnet)",
-            max_turns="Max tool-use turns per prompt (default: 100)",
-            effort="Reasoning effort level: low, medium, high, max (default: medium)",
+            max_turns="Max tool-use turns per prompt (default: 250)",
+            effort="Reasoning effort: low, medium, high, max (default: high)",
+            permission_mode="Permission mode (default: bypassPermissions)",
         )
         async def slash_cc_start(
             interaction: discord.Interaction,
             workdir: str,
             model: str = "sonnet",
-            max_turns: int = 100,
+            max_turns: int = 250,
             effort: str = "",
+            permission_mode: str = "",
         ):
             await interaction.response.defer(ephemeral=True)
-            await self._handle_cc_start_slash(interaction, workdir, model, max_turns, effort)
+            await self._handle_cc_start_slash(
+                interaction, workdir, model, max_turns, effort, permission_mode
+            )
 
         @tree.command(name="cc-status", description="Show Claude Code status for this thread")
         async def slash_cc_status(interaction: discord.Interaction):
@@ -3076,6 +3080,21 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_cc_stop(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True)
             await self._handle_cc_stop_slash(interaction)
+
+        @tree.command(name="cc-set", description="Update Claude Code session settings for this thread")
+        @discord.app_commands.describe(
+            max_turns="New max tool-use turns per prompt (e.g. 500 for long tasks)",
+            effort="Reasoning effort: low, medium, high, max",
+            permission_mode="Permission mode (e.g. bypassPermissions, acceptEdits)",
+        )
+        async def slash_cc_set(
+            interaction: discord.Interaction,
+            max_turns: int = 0,
+            effort: str = "",
+            permission_mode: str = "",
+        ):
+            await interaction.response.defer(ephemeral=True)
+            await self._handle_cc_set_slash(interaction, max_turns, effort, permission_mode)
 
         @tree.command(name="queue", description="Queue a prompt for the next turn (doesn't interrupt)")
         @discord.app_commands.describe(prompt="The prompt to queue")
@@ -3573,8 +3592,9 @@ class DiscordAdapter(BasePlatformAdapter):
         interaction: discord.Interaction,
         workdir: str,
         model: str = "sonnet",
-        max_turns: int = 100,
+        max_turns: int = 250,
         effort: str = "",
+        permission_mode: str = "",
     ) -> None:
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.followup.send(
@@ -3591,6 +3611,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 model=model,
                 max_turns=max_turns,
                 effort=effort or None,
+                permission_mode=permission_mode or None,
             )
         except Exception as exc:
             await interaction.followup.send(f"Failed to attach Claude Code: {exc}", ephemeral=True)
@@ -3598,15 +3619,74 @@ class DiscordAdapter(BasePlatformAdapter):
 
         self._threads.mark(str(interaction.channel.id))
         effort_display = session.get("effort") or "default (medium)"
+        max_turns_display = session.get("max_turns", max_turns)
+        permission_display = session.get("permission_mode", "bypassPermissions")
         await interaction.followup.send(
             (
                 "Claude Code attached to this thread.\n"
                 f"workdir: `{session['workdir']}`\n"
                 f"model: `{session['model']}`\n"
-                f"max_turns: `{session['max_turns']}`\n"
+                f"max_turns: `{max_turns_display}`\n"
                 f"effort: `{effort_display}`\n"
+                f"permission_mode: `{permission_display}`\n"
                 "Send normal messages in this thread and they'll go to Claude Code.\n"
-                "Use `/cc-status` or `/cc-stop` when needed."
+                "Use `/cc-status`, `/cc-set`, or `/cc-stop` when needed."
+            ),
+            ephemeral=True,
+        )
+
+    async def _handle_cc_set_slash(
+        self,
+        interaction: discord.Interaction,
+        max_turns: int = 0,
+        effort: str = "",
+        permission_mode: str = "",
+    ) -> None:
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.followup.send(
+                "`/cc-set` only makes sense inside a thread.",
+                ephemeral=True,
+            )
+            return
+        thread_id = str(interaction.channel.id)
+        if not self._claude_code_bridge.is_active(thread_id):
+            await interaction.followup.send(
+                "No Claude Code session attached. Use `/cc-start` first.",
+                ephemeral=True,
+            )
+            return
+        if max_turns <= 0 and not effort and not permission_mode:
+            await interaction.followup.send(
+                "Provide at least one of: `max_turns`, `effort`, `permission_mode`.",
+                ephemeral=True,
+            )
+            return
+        try:
+            session = self._claude_code_bridge.update_session(
+                thread_id,
+                max_turns=max_turns if max_turns > 0 else None,
+                effort=effort or None,
+                permission_mode=permission_mode or None,
+            )
+        except Exception as exc:
+            await interaction.followup.send(
+                f"Failed to update Claude Code session: {exc}",
+                ephemeral=True,
+            )
+            return
+        if not session:
+            await interaction.followup.send(
+                "No Claude Code session attached. Use `/cc-start` first.",
+                ephemeral=True,
+            )
+            return
+        effort_display = session.get("effort") or "default (medium)"
+        await interaction.followup.send(
+            (
+                "Claude Code session updated.\n"
+                f"max_turns: `{session.get('max_turns', '—')}`\n"
+                f"effort: `{effort_display}`\n"
+                f"permission_mode: `{session.get('permission_mode', '—')}`"
             ),
             ephemeral=True,
         )

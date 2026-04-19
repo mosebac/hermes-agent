@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "sonnet"
 _DEFAULT_PERMISSION_MODE = "bypassPermissions"
-_DEFAULT_MAX_TURNS = 100
+_DEFAULT_MAX_TURNS = 250
 _DEFAULT_TIMEOUT_SECONDS = 900
-_DEFAULT_EFFORT = ""  # empty = let Claude Code use its own default (medium)
+_DEFAULT_EFFORT = "high"
 _VALID_EFFORT_LEVELS = ("low", "medium", "high", "max")
 
 
@@ -105,6 +105,38 @@ class ClaudeCodeThreadBridge:
 
     def get_session(self, thread_id: str) -> Optional[dict[str, Any]]:
         return self._load_state().get("threads", {}).get(str(thread_id))
+
+    def update_session(
+        self,
+        thread_id: str,
+        *,
+        max_turns: int | None = None,
+        effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> Optional[dict[str, Any]]:
+        state = self._load_state()
+        threads = state.setdefault("threads", {})
+        session = threads.get(str(thread_id))
+        if not session:
+            return None
+        if max_turns is not None:
+            if int(max_turns) <= 0:
+                raise ValueError("max_turns must be > 0")
+            session["max_turns"] = int(max_turns)
+        if effort is not None:
+            eff = effort.strip().lower()
+            if eff and eff not in _VALID_EFFORT_LEVELS:
+                raise ValueError(f"invalid effort '{eff}': choose from {_VALID_EFFORT_LEVELS}")
+            session["effort"] = eff
+        if permission_mode is not None:
+            pm = permission_mode.strip()
+            if not pm:
+                raise ValueError("permission_mode cannot be empty")
+            session["permission_mode"] = pm
+        session["updated_at"] = self._now_iso()
+        threads[str(thread_id)] = session
+        self._save_state(state)
+        return session
 
     def stop_session(self, thread_id: str) -> bool:
         state = self._load_state()

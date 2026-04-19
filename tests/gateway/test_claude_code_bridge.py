@@ -77,6 +77,66 @@ async def test_run_prompt_updates_session_id_and_reuses_resume(tmp_path):
     assert calls[0][1]["cwd"] == str(workdir.resolve())
 
 
+def test_start_session_uses_new_defaults(tmp_path):
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    bridge = ClaudeCodeThreadBridge(state_path=tmp_path / "state.json")
+
+    session = bridge.start_session(
+        thread_id="thread-1",
+        channel_id="thread-1",
+        user_id="42",
+        workdir=str(workdir),
+    )
+
+    assert session["max_turns"] == 250
+    assert session["effort"] == "high"
+    assert session["permission_mode"] == "bypassPermissions"
+
+
+def test_update_session_changes_fields_in_place(tmp_path):
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    bridge = ClaudeCodeThreadBridge(state_path=tmp_path / "state.json")
+    bridge.start_session(
+        thread_id="thread-1",
+        channel_id="thread-1",
+        user_id="42",
+        workdir=str(workdir),
+    )
+
+    updated = bridge.update_session(
+        "thread-1",
+        max_turns=500,
+        effort="low",
+        permission_mode="acceptEdits",
+    )
+
+    assert updated["max_turns"] == 500
+    assert updated["effort"] == "low"
+    assert updated["permission_mode"] == "acceptEdits"
+    assert bridge.get_session("thread-1")["max_turns"] == 500
+
+
+def test_update_session_returns_none_when_thread_unknown(tmp_path):
+    bridge = ClaudeCodeThreadBridge(state_path=tmp_path / "state.json")
+    assert bridge.update_session("missing", max_turns=500) is None
+
+
+def test_update_session_rejects_invalid_effort(tmp_path):
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    bridge = ClaudeCodeThreadBridge(state_path=tmp_path / "state.json")
+    bridge.start_session(
+        thread_id="thread-1",
+        channel_id="thread-1",
+        user_id="42",
+        workdir=str(workdir),
+    )
+    with pytest.raises(ValueError):
+        bridge.update_session("thread-1", effort="ridiculous")
+
+
 @pytest.mark.asyncio
 async def test_run_prompt_falls_back_to_plain_text_when_json_missing(tmp_path):
     workdir = tmp_path / "repo"
