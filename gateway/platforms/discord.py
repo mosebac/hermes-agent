@@ -50,7 +50,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 import re
 
-from gateway.platforms.claude_code_bridge import ClaudeCodeThreadBridge
+from gateway.platforms.claude_code_bridge import CC_HELP_BLOCK, ClaudeCodeThreadBridge
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
 from utils import atomic_json_write
 from gateway.platforms.base import (
@@ -3631,6 +3631,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 f"permission_mode: `{permission_display}`\n"
                 "Send normal messages in this thread and they'll go to Claude Code.\n"
                 "Use `/cc-status`, `/cc-set`, or `/cc-stop` when needed."
+                + CC_HELP_BLOCK
             ),
             ephemeral=True,
         )

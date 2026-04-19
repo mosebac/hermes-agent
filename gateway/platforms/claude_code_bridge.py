@@ -27,6 +27,14 @@ _DEFAULT_TIMEOUT_SECONDS = 900
 _DEFAULT_EFFORT = "high"
 _VALID_EFFORT_LEVELS = ("low", "medium", "high", "max")
 
+CC_HELP_BLOCK = (
+    "\n─ Réglages (modifiables via `/cc-set`) ─\n"
+    "• `max_turns:<n>` — default 250, monte à 500+ pour longues sessions\n"
+    "• `effort:<low|medium|high|max>` — default high\n"
+    "• `permission_mode:<bypassPermissions|acceptEdits|default|plan>` — default bypassPermissions\n"
+    "Ex: `/cc-set max_turns:500 effort:max`"
+)
+
 
 @dataclass
 class ClaudeCodeRunResult:
@@ -162,6 +170,7 @@ class ClaudeCodeThreadBridge:
             f"effort: `{effort}`\n"
             f"session_id: `{session_id}`\n"
             f"updated: `{session.get('updated_at', '—')}`"
+            + CC_HELP_BLOCK
         )
 
     async def run_prompt(self, thread_id: str, prompt: str) -> ClaudeCodeRunResult:
