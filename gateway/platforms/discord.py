@@ -1066,6 +1066,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """Finish non-critical startup work after Discord is connected."""
         if not self._client:
             return
+        tree = self._client.tree
         try:
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
@@ -1127,16 +1128,38 @@ class DiscordAdapter(BasePlatformAdapter):
                 summary["created"],
                 summary["deleted"],
             )
+            return
         except asyncio.TimeoutError:
             logger.warning(
                 "[%s] Slash command sync timed out — Discord rate-limit bucket "
                 "may be saturated; will retry on next reconnect",
                 self.name,
             )
+            return
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # pragma: no cover - defensive logging
-            logger.warning("[%s] Slash command sync failed: %s", self.name, e, exc_info=True)
+        except Exception as e:
+            logger.warning("[%s] Slash command sync failed: %s", self.name, e)
+
+        # Fallback: the /skill group can still blow past Discord's 8000-byte
+        # payload limit and take the whole sync down. Drop it and retry so
+        # critical direct commands like /cc-start, /cc-set, /cc-status still land.
+        try:
+            tree.remove_command("skill")
+        except Exception:
+            pass
+        try:
+            synced = await asyncio.wait_for(tree.sync(), timeout=120)
+            logger.warning(
+                "[%s] Re-synced %d slash command(s) without /skill group"
+                " (fallback after size-limit failure)",
+                self.name, len(synced),
+            )
+        except Exception as e:
+            logger.error(
+                "[%s] Fallback slash command sync also failed: %s",
+                self.name, e, exc_info=True,
+            )
 
     def _get_discord_command_sync_policy(self) -> str:
         raw = str(os.getenv("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
