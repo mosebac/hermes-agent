@@ -69,3 +69,31 @@ Patched `gateway/run.py` and `tools/process_registry.py` so the gateway now drai
 
 ### Prevention
 For Hermes → Claude Code orchestration, never trust one notification path. Keep watcher delivery and queue-drain fallback in parity, mark completions as delivered/consumed explicitly, and require a live end-to-end proof (real Claude background proc + actual in-channel completion message) after any reporting patch.
+
+## 2026-05-04 — custom Hermes upgrade rebased cleanly only after conflict-aware patch merges
+
+### Symptom
+Upgrading the local `local/custom-patches` branch from `v0.9.0` to upstream `v0.12.0` failed on rebase conflicts and the first merged result left the targeted Discord/Claude-Code regression slice broken.
+
+### Root Cause
+Local patches for transcription, Discord Claude Code bridge, media routing, completion reporting, and slash-sync fallback overlapped with large upstream changes in `transcription_tools.py`, `gateway/platforms/discord.py`, `gateway/run.py`, and Discord test scaffolding. The post-rebase test slice also exposed drift between newer upstream slash-command test mocks and local assumptions (`FakeTree.add_command`, watcher legacy payloads with missing `chat_type`, and formatter/default-thread-name expectations).
+
+### Fix
+Completed the rebase manually, preserving local bridge/reporting behavior while keeping upstream command-sync logic. Then finished the skipped post-rebase steps (`pip install -e '.[all]'`, patch regeneration), fixed the remaining merge drift, and re-ran the authoritative patch verification slice until it passed: `70 passed` across completion fallback, Claude Code bridge, Discord slash commands, and audio cache tests.
+
+### Prevention
+On this machine, never treat Hermes upgrades as a blind `git rebase`. Use `~/.hermes/bin/hermes-update`, expect conflicts in the documented Discord/transcription files, and always run the patch verification slice from `~/.hermes/PATCHES.md` before declaring the upgrade complete.
+
+## 2026-05-04 — Discord audio transcription failed after local Whisper CPU patch
+
+### Symptom
+Discord voice/audio messages returned an internal Whisper error. Gateway logs showed `UnboundLocalError: cannot access local variable 'WhisperModel' where it is not associated with a value` in `tools/transcription_tools.py` when loading the local faster-whisper model.
+
+### Root Cause
+The local WSL2 patch changed `_transcribe_local()` to instantiate `WhisperModel(...)` directly on CPU/int8, but the function still had a later `from faster_whisper import WhisperModel` inside the CUDA-runtime fallback block. Python therefore treated `WhisperModel` as a function-local variable everywhere, making the earlier direct CPU instantiation read it before assignment.
+
+### Fix
+Moved the `from faster_whisper import WhisperModel` import to the top of `_transcribe_local()` after the faster-whisper availability check and removed the nested fallback import. Updated transcription tests so the machine-local patch asserts direct CPU/int8 loading instead of upstream `auto`/CUDA probing.
+
+### Prevention
+When a local patch bypasses an upstream helper and calls a lazily imported dependency directly, keep the import before first use in the same function and run the transcription unit tests plus a real local `_transcribe_local()` smoke test before restarting the gateway.

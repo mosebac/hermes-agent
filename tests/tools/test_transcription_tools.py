@@ -509,8 +509,8 @@ class TestTranscribeLocalExtended:
         assert result["success"] is True
         assert result["transcript"] == "Hello world"
 
-    def test_load_time_cuda_lib_failure_falls_back_to_cpu(self, tmp_path):
-        """Missing libcublas at load time → reload on CPU, succeed."""
+    def test_local_patch_loads_cpu_int8_directly(self, tmp_path):
+        """Machine-local patch must bypass auto/CUDA and load CPU int8 directly."""
         audio = tmp_path / "test.ogg"
         audio.write_bytes(b"fake")
 
@@ -540,7 +540,7 @@ class TestTranscribeLocalExtended:
 
         assert result["success"] is True
         assert result["transcript"] == "hi"
-        assert call_args == [("auto", "auto"), ("cpu", "int8")]
+        assert call_args == [("cpu", "int8")]
 
     def test_runtime_cuda_lib_failure_evicts_cache_and_retries_on_cpu(self, tmp_path):
         """libcublas dlopen fails at transcribe() → evict cache, reload CPU, retry."""
@@ -553,7 +553,8 @@ class TestTranscribeLocalExtended:
         info.language = "en"
         info.duration = 1.0
 
-        # First model loads fine (auto), but transcribe() blows up on dlopen
+        # First CPU model raises a CUDA-library-flavored runtime error (stale
+        # cached/driver-confused backend); second forced CPU model works.
         gpu_model = MagicMock()
         gpu_model.transcribe.side_effect = RuntimeError(
             "Library libcublas.so.12 is not found or cannot be loaded"
@@ -578,8 +579,8 @@ class TestTranscribeLocalExtended:
 
         assert result["success"] is True
         assert result["transcript"] == "recovered"
-        # First load is auto, retry forces CPU.
-        assert call_args == [("auto", "auto"), ("cpu", "int8")]
+        # First load is the local patch's direct CPU path; retry also forces CPU.
+        assert call_args == [("cpu", "int8"), ("cpu", "int8")]
         # Cached-bad-model eviction: the broken GPU model was called once,
         # then discarded; the CPU model served the retry.
         assert gpu_model.transcribe.call_count == 1
