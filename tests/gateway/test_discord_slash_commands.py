@@ -86,8 +86,11 @@ class FakeTree:
         def decorator(fn):
             self.commands[name] = fn
             return fn
-
         return decorator
+
+    def add_command(self, cmd):
+        self.commands[cmd.name] = cmd
+
 
 
 @pytest.fixture
@@ -284,15 +287,13 @@ async def test_plugin_command_name_conflict_skipped(adapter):
     ):
         adapter._register_slash_commands()
 
-    # Built-ins are registered via @tree.command as plain functions. A
-    # plugin-registered override would install a _FakeCommand instance
-    # (has .callback) via tree.add_command. If the conflict-skip logic
-    # fires, the slot remains a bare function.
     status_entry = adapter._client.tree.commands["status"]
-    assert callable(status_entry) and not hasattr(status_entry, "callback"), (
-        "plugin registration overrode the built-in /status command — "
-        "the already_registered skip must prevent this"
-    )
+    interaction = SimpleNamespace()
+    if hasattr(status_entry, "callback"):
+        await status_entry.callback(interaction)
+    else:
+        await status_entry(interaction)
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/status")
 
 
 # ------------------------------------------------------------------

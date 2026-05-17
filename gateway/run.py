@@ -1052,7 +1052,7 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     _cmd = evt.get("command", "unknown")
 
     if evt_type == "watch_disabled":
-        return f"[IMPORTANT: {evt.get('message', '')}]"
+        return f"[SYSTEM: {evt.get('message', '')}]"
 
     if evt_type == "watch_match":
         _pat = evt.get("pattern", "?")
@@ -13661,6 +13661,11 @@ class GatewayRunner:
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
+        # Legacy watcher payloads/tests may carry platform+chat_id but no chat_type.
+        # Prefer parsed/persisted origin when available; otherwise fall back to a
+        # conservative direct-message shape so completion notifications still route.
+        if not chat_type and platform_name and chat_id:
+            chat_type = "dm"
         if not platform_name or not chat_type or not chat_id:
             return None
 
